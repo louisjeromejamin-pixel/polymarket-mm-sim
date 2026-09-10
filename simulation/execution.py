@@ -1,29 +1,35 @@
-"""Moteur d'exécution et comptabilité du portefeuille simulé.
+"""Execution engine and portfolio accounting for the simulated market.
 
-Ce module remplace les deux dépendances externes du keeper amont — l'API CLOB
-et la blockchain — par une simulation locale. Les stratégies restent
-inchangées : elles reçoivent le même ``OrderBook`` et renvoient les mêmes
-listes d'ordres à annuler et à placer.
+Replaces the two external dependencies of the upstream keeper — the CLOB API
+and the blockchain — with a local simulation. Strategies are untouched: they
+receive the same ``OrderBook`` and return the same lists of orders to cancel
+and place.
+
+Fills are driven by counterparty flow rather than a bare probability. A maker
+order fills when a counterparty wants the other side and the price is
+marketable, which is what makes the maker's revenue depend on *who* it trades
+against.
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from poly_market_maker.order import Order, Side
 from poly_market_maker.token import Collateral, Token
 
-from .market_sim import SimulatedMarket
+from .market_sim import OrderFlow, SimulatedMarket
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Fill:
-    """Exécution d'un ordre, totale ou partielle."""
+    """A full or partial execution."""
 
     step: int
     price: float
@@ -31,6 +37,7 @@ class Fill:
     side: Side
     token: Token
     order_id: str
+    informed_counterparty: bool = False
 
     @property
     def notional(self) -> float:
@@ -39,29 +46,33 @@ class Fill:
 
 @dataclass
 class ExecutionConfig:
-    """Paramètres du modèle d'exécution.
+    """Execution model parameters.
 
     Attributes:
-        maker_fee: Frais proportionnels au notionnel. Polymarket ne
-            prélève pas de frais maker à ce jour ; le paramètre existe pour
-            mesurer la sensibilité de la stratégie s'ils étaient introduits.
-        fill_probability: Probabilité qu'un ordre au prix touché soit
-            exécuté sur un pas. En dessous de 1, il modélise la file
-            d'attente : être au bon prix ne garantit pas d'être servi.
-        max_fill_ratio: Fraction maximale d'un ordre exécutée en un pas.
+        maker_fee: Proportional fee on notional. Polymarket charges no maker
+            fee today; the parameter exists to measure sensitivity if one
+            were introduced.
+        queue_priority: Probability of being served when a counterparty order
+            arrives at the maker's price. Below 1 it models queue position:
+            being at the right price does not guarantee being filled.
+        size_per_order: Shares demanded by one counterparty order.
+        uninformed_tolerance: How far from the mid an uninformed
+            counterparty will still trade. This concession is what the maker
+            earns; informed counterparties concede nothing.
     """
 
     maker_fee: float = 0.0
-    fill_probability: float = 0.6
-    max_fill_ratio: float = 0.5
+    queue_priority: float = 0.7
+    size_per_order: float = 25.0
+    uninformed_tolerance: float = 0.04
 
 
 class Portfolio:
-    """Suit le collatéral, les positions et la valeur liquidative.
+    """Tracks collateral, positions and mark-to-market value.
 
-    Convention Polymarket : détenir une part du token A et une part du
-    token B du même marché garantit exactement 1 USDC à la résolution,
-    puisque les deux issues sont complémentaires.
+    Polymarket convention: holding one share of token A and one of token B in
+    the same market guarantees exactly 1 USDC at resolution, the outcomes
+    being complementary.
     """
 
     def __init__(self, initial_collateral: float = 1000.0):
@@ -72,7 +83,7 @@ class Portfolio:
         self.fees_paid = 0.0
 
     def apply_fill(self, fill: Fill, fee_rate: float) -> None:
-        """Met à jour le portefeuille après une exécution."""
+        """Update the portfolio after an execution."""
         fee = fill.notional * fee_rate
         self.fees_paid += fee
 
@@ -86,7 +97,7 @@ class Portfolio:
         self.fills.append(fill)
 
     def balances(self) -> dict:
-        """Renvoie les soldes au format attendu par les stratégies amont."""
+        """Balances in the shape upstream strategies expect."""
         return {
             Collateral: self.collateral,
             Token.A: self.positions[Token.A],
@@ -94,7 +105,7 @@ class Portfolio:
         }
 
     def mark_to_market(self, price_a: float) -> float:
-        """Valeur liquidative aux prix courants."""
+        """Portfolio value at current prices."""
         price_b = 1.0 - price_a
         return (
             self.collateral
@@ -103,31 +114,27 @@ class Portfolio:
         )
 
     def value_at_resolution(self, outcome: int) -> float:
-        """Valeur finale une fois le marché résolu.
-
-        Le token gagnant vaut 1, le perdant 0.
-        """
+        """Final value once the market resolves: winner pays 1, loser 0."""
         winning = Token.A if outcome == 1 else Token.B
         return self.collateral + self.positions[winning]
 
     @property
     def inventory_skew(self) -> float:
-        """Déséquilibre entre les deux jambes, en parts.
+        """Signed imbalance between the two legs, in shares.
 
-        Un market maker vise un inventaire équilibré : c'est cet écart qui
-        l'expose au mouvement du prix.
+        A market maker targets a balanced inventory; this gap is its exposure
+        to price moves.
         """
         return self.positions[Token.A] - self.positions[Token.B]
 
 
 class ExecutionEngine:
-    """Confronte les ordres du market maker au marché simulé.
+    """Matches the maker's orders against counterparty flow.
 
-    Un ordre d'achat s'exécute quand le marché descend à son prix ou en
-    dessous ; un ordre de vente quand le marché y monte. L'exécution est
-    partielle et probabiliste, pour ne pas surestimer la performance : sur
-    un vrai carnet, un ordre au meilleur prix n'est pas systématiquement
-    servi.
+    A counterparty buy order lifts the maker's sell quotes; a counterparty
+    sell order hits the maker's buy quotes. Filling informed flow leaves the
+    maker on the wrong side of the next move; filling uninformed flow earns
+    the spread.
     """
 
     def __init__(
@@ -137,8 +144,6 @@ class ExecutionEngine:
         config: Optional[ExecutionConfig] = None,
         seed: Optional[int] = None,
     ):
-        import random
-
         self.market = market
         self.portfolio = portfolio
         self.config = config or ExecutionConfig()
@@ -147,87 +152,116 @@ class ExecutionEngine:
         self._id_counter = itertools.count(1)
 
     def place_orders(self, orders: List[Order]) -> None:
-        """Enregistre de nouveaux ordres, en leur attribuant un identifiant."""
+        """Register new orders, assigning an id to each."""
         for order in orders:
             if order.id is None:
                 order.id = f"sim-{next(self._id_counter)}"
             self.open_orders.append(order)
 
     def cancel_orders(self, orders: List[Order]) -> None:
-        """Retire des ordres du carnet."""
+        """Remove orders from the book."""
         to_cancel = {order.id for order in orders}
         self.open_orders = [o for o in self.open_orders if o.id not in to_cancel]
 
     def cancel_all(self) -> None:
         self.open_orders = []
 
-    def match(self) -> List[Fill]:
-        """Confronte les ordres ouverts au marché et applique les exécutions."""
+    def match(self, flow: OrderFlow) -> List[Fill]:
+        """Match open orders against this step's counterparty flow."""
         fills: List[Fill] = []
+
+        # Counterparty buys consume the maker's sell quotes, and vice versa.
+        demand = {
+            Side.SELL: flow.buy_orders * self.config.size_per_order,
+            Side.BUY: flow.sell_orders * self.config.size_per_order,
+        }
+        if not any(demand.values()):
+            return fills
+
         still_open: List[Order] = []
 
-        for order in self.open_orders:
-            filled_size = self._fill_size(order)
+        # Best prices first: a counterparty takes the most favourable quote.
+        for order in self._by_price_priority():
+            remaining_demand = demand.get(order.side, 0.0)
 
-            if filled_size <= 0:
+            if remaining_demand <= 0 or not self._is_marketable(order, flow):
                 still_open.append(order)
                 continue
 
+            if self._rng.random() > self.config.queue_priority:
+                still_open.append(order)  # someone else was ahead in the queue
+                continue
+
+            filled = min(order.size, remaining_demand)
             fill = Fill(
                 step=self.market.step,
                 price=order.price,
-                size=filled_size,
+                size=round(filled, 2),
                 side=order.side,
                 token=order.token,
                 order_id=order.id,
+                informed_counterparty=flow.informed,
             )
 
-            if not self._can_afford(fill):
+            if fill.size <= 0 or not self._can_afford(fill):
                 still_open.append(order)
                 continue
 
             self.portfolio.apply_fill(fill, self.config.maker_fee)
             fills.append(fill)
+            demand[order.side] = remaining_demand - fill.size
 
-            remaining = round(order.size - filled_size, 4)
-            if remaining > 0:
-                order.size = remaining
+            remainder = round(order.size - fill.size, 4)
+            if remainder > 0:
+                order.size = remainder
                 still_open.append(order)
 
         self.open_orders = still_open
         return fills
 
-    def _fill_size(self, order: Order) -> float:
-        """Détermine la quantité exécutée d'un ordre sur ce pas."""
-        # Le prix du token B est le complément de celui du token A.
+    def _by_price_priority(self) -> List[Order]:
+        """Orders in the sequence a counterparty would take them.
+
+        Counterparties hit the highest bid and lift the lowest ask.
+        """
+        buys = sorted(
+            (o for o in self.open_orders if o.side == Side.BUY),
+            key=lambda o: -o.price,
+        )
+        sells = sorted(
+            (o for o in self.open_orders if o.side == Side.SELL),
+            key=lambda o: o.price,
+        )
+        return buys + sells
+
+    def _is_marketable(self, order: Order, flow: OrderFlow) -> bool:
+        """Whether a counterparty would accept this quote.
+
+        Uninformed counterparties trade for reasons unrelated to price and
+        accept quotes within ``uninformed_tolerance`` of the mid — that
+        concession is the maker's revenue.
+
+        Informed counterparties know where the price is going and will not
+        pay a worse price than the mid. Requiring them to cross the mid is
+        what makes adverse selection bite: the maker only trades with them
+        when its own quote is already unfavourable.
+        """
         market_price = (
             self.market.mid_price
             if order.token == Token.A
             else round(1.0 - self.market.mid_price, 2)
         )
+        tolerance = 0.0 if flow.informed else self.config.uninformed_tolerance
 
-        # Un achat passe quand le marche descend jusqu'au prix de l'ordre ;
-        # une vente quand il y monte.
-        touched = (
-            market_price <= order.price
-            if order.side == Side.BUY
-            else market_price >= order.price
-        )
-        if not touched:
-            return 0.0
-
-        if self._rng.random() > self.config.fill_probability:
-            return 0.0
-
-        ratio = self._rng.uniform(0.1, self.config.max_fill_ratio)
-        return round(order.size * ratio, 2)
+        if order.side == Side.BUY:
+            return order.price >= market_price - tolerance
+        return order.price <= market_price + tolerance
 
     def _can_afford(self, fill: Fill) -> bool:
-        """Vérifie que le portefeuille peut absorber l'exécution.
+        """Whether the portfolio can absorb the execution.
 
-        On refuse un achat à découvert de collatéral et une vente de parts
-        qu'on ne détient pas : le simulateur doit rester réaliste, sinon les
-        résultats de backtest n'ont aucune valeur.
+        Buying without collateral or selling shares not held is refused: a
+        simulator that allows either produces meaningless backtests.
         """
         if fill.side == Side.BUY:
             cost = fill.notional * (1 + self.config.maker_fee)

@@ -1,18 +1,27 @@
-"""Marché synthétique pour un contrat binaire de type Polymarket.
+"""Synthetic market for a Polymarket-style binary contract.
 
-Un marché de prédiction binaire se résout à 0 ou 1. Son prix, borné dans
-``(0, 1)``, s'interprète directement comme une probabilité. Une marche
-aléatoire arithmétique classique conviendrait mal : elle sortirait de
-l'intervalle et attribuerait la même volatilité absolue à un prix de 0,50 et
-à un prix de 0,02, alors qu'un contrat quasi résolu bouge beaucoup moins.
+A binary prediction market resolves to 0 or 1, so its price is bounded in
+``(0, 1)`` and reads directly as a probability. An arithmetic random walk
+would leave that interval and would assign the same absolute volatility at
+0.50 as at 0.02, where a near-resolved contract barely moves.
 
-On simule donc le prix en **log-odds** (le logit de la probabilité) :
+The price therefore evolves in **log-odds**:
 
     logit(p) = log(p / (1 - p))
 
-où la marche aléatoire est libre sur tout l'axe réel. La transformation
-inverse (la sigmoïde) ramène le prix dans ``(0, 1)`` par construction, et
-compresse naturellement les mouvements près des bornes.
+The walk is unconstrained on the real line and the sigmoid maps it back into
+``(0, 1)`` by construction, compressing moves near the boundaries.
+
+Order flow is split in two, because the distinction determines whether market
+making is viable at all:
+
+**Informed flow** trades ahead of the price move. A market maker who fills it
+is on the wrong side — this is adverse selection.
+
+**Uninformed flow** trades for reasons unrelated to the next price move
+(hedging, liquidity, noise). Filling it earns the spread. It is the actual
+source of a market maker's revenue, and a simulator without it makes every
+strategy lose by construction.
 """
 
 from __future__ import annotations
@@ -24,12 +33,12 @@ from typing import List, Optional
 
 
 def logit(p: float) -> float:
-    """Convertit une probabilité en log-odds."""
+    """Convert a probability to log-odds."""
     return math.log(p / (1.0 - p))
 
 
 def sigmoid(x: float) -> float:
-    """Convertit des log-odds en probabilité, sans risque d'overflow."""
+    """Convert log-odds to a probability, overflow-safe."""
     if x >= 0:
         z = math.exp(-x)
         return 1.0 / (1.0 + z)
@@ -39,56 +48,89 @@ def sigmoid(x: float) -> float:
 
 @dataclass
 class MarketConfig:
-    """Paramètres du marché simulé.
+    """Parameters of the simulated market.
 
     Attributes:
-        initial_price: Probabilité initiale du contrat, dans ``(0, 1)``.
-        volatility: Écart-type du pas de la marche aléatoire en log-odds.
-        drift: Dérive par pas en log-odds. Positif = le marché tend vers
-            "oui". Zéro correspond à une martingale, cas le plus honnête
-            pour évaluer un market maker.
-        spread_ticks: Demi-écart du carnet externe, en ticks d'un cent.
-        liquidity_size: Taille disponible à chaque niveau du carnet externe.
-        tick: Granularité des prix (Polymarket cote au cent).
-        resolution_step: Pas auquel le marché se résout, ou ``None`` pour
-            qu'il ne se résolve jamais.
+        initial_price: Starting probability, in ``(0, 1)``.
+        volatility: Standard deviation of the log-odds step.
+        drift: Log-odds drift per step. Zero is a martingale, the honest
+            setting for evaluating a market maker.
+        informed_ratio: Share of order flow that trades ahead of the price
+            move. At 1.0 every counterparty is informed and no strategy can
+            profit; empirically prediction markets sit well below that.
+        flow_intensity: Expected number of counterparty orders per step.
+        spread_ticks: Half-width of the external book, in one-cent ticks.
+        tick: Price granularity (Polymarket quotes in cents).
+        resolution_step: Step at which the market resolves, or ``None``.
     """
 
     initial_price: float = 0.50
     volatility: float = 0.15
     drift: float = 0.0
+    informed_ratio: float = 0.35
+    flow_intensity: float = 2.0
     spread_ticks: int = 2
-    liquidity_size: float = 500.0
     tick: float = 0.01
     resolution_step: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not 0.0 < self.initial_price < 1.0:
-            raise ValueError("initial_price doit être strictement entre 0 et 1")
+            raise ValueError("initial_price must lie strictly between 0 and 1")
         if self.volatility < 0:
-            raise ValueError("volatility doit être positive")
+            raise ValueError("volatility must be non-negative")
+        if not 0.0 <= self.informed_ratio <= 1.0:
+            raise ValueError("informed_ratio must lie in [0, 1]")
+        if self.flow_intensity < 0:
+            raise ValueError("flow_intensity must be non-negative")
         if self.spread_ticks < 1:
-            raise ValueError("spread_ticks doit valoir au moins 1")
+            raise ValueError("spread_ticks must be at least 1")
+
+
+@dataclass
+class OrderFlow:
+    """Counterparty orders arriving on one step.
+
+    Attributes:
+        buy_orders: Number of counterparties wanting to buy (they lift asks).
+        sell_orders: Number wanting to sell (they hit bids).
+        informed: Whether this batch trades ahead of the price move.
+    """
+
+    buy_orders: int = 0
+    sell_orders: int = 0
+    informed: bool = False
+
+    @property
+    def imbalance(self) -> float:
+        """Signed flow imbalance in ``[-1, 1]``.
+
+        The most informative single feature available to a market maker:
+        persistent one-sided flow precedes price moves.
+        """
+        total = self.buy_orders + self.sell_orders
+        if total == 0:
+            return 0.0
+        return (self.buy_orders - self.sell_orders) / total
 
 
 @dataclass
 class MarketState:
-    """Instantané du marché à un pas donné."""
+    """Snapshot of the market at one step."""
 
     step: int
     mid_price: float
     best_bid: float
     best_ask: float
+    flow: OrderFlow = field(default_factory=OrderFlow)
     resolved: bool = False
     outcome: Optional[int] = None
 
 
 class SimulatedMarket:
-    """Marché binaire dont le prix suit une marche aléatoire en log-odds.
+    """Binary market whose price follows a log-odds random walk.
 
-    Le marché expose un prix milieu et un carnet à deux faces. Il ne connaît
-    ni les ordres du market maker ni ses positions : c'est le simulateur
-    d'exécution qui confronte les deux.
+    The market does not know the maker's orders or positions; the execution
+    engine matches the two.
     """
 
     def __init__(self, config: MarketConfig, seed: Optional[int] = None):
@@ -99,15 +141,47 @@ class SimulatedMarket:
         self.resolved = False
         self.outcome: Optional[int] = None
         self.history: List[MarketState] = []
+
+        # The next step's shock is drawn one step early so informed flow can
+        # be aligned with it: informed counterparties trade in the direction
+        # the price is about to move.
+        self._next_shock = self._draw_shock()
+        self.flow = self._draw_flow(self._next_shock)
         self._record()
+
+    def _draw_shock(self) -> float:
+        return self._rng.gauss(self.config.drift, self.config.volatility)
+
+    def _draw_flow(self, next_shock: float) -> OrderFlow:
+        """Generate the counterparty orders for this step.
+
+        Informed batches lean in the direction of the upcoming move;
+        uninformed batches are symmetric around zero.
+        """
+        cfg = self.config
+        n_orders = _poisson(self._rng, cfg.flow_intensity)
+
+        if n_orders == 0:
+            return OrderFlow()
+
+        informed = self._rng.random() < cfg.informed_ratio
+
+        if informed:
+            # Directional: most orders lean the way the price will move.
+            p_buy = 0.85 if next_shock > 0 else 0.15
+        else:
+            p_buy = 0.5
+
+        buys = sum(1 for _ in range(n_orders) if self._rng.random() < p_buy)
+        return OrderFlow(buy_orders=buys, sell_orders=n_orders - buys, informed=informed)
 
     @property
     def mid_price(self) -> float:
-        """Prix milieu, arrondi au tick."""
+        """Mid price, rounded to the tick."""
         raw = sigmoid(self._logit_price)
         ticks = round(raw / self.config.tick)
-        # On garde au moins un tick de marge avec 0 et 1 : un contrat
-        # binaire non résolu ne cote jamais exactement à ses bornes.
+        # Keep at least one tick away from 0 and 1: an unresolved binary
+        # contract never trades exactly at its bounds.
         ticks = max(1, min(ticks, int(round(1 / self.config.tick)) - 1))
         return round(ticks * self.config.tick, 2)
 
@@ -120,13 +194,15 @@ class SimulatedMarket:
         return round(self.mid_price + self.config.spread_ticks * self.config.tick, 2)
 
     def advance(self) -> MarketState:
-        """Fait avancer le marché d'un pas et renvoie le nouvel état."""
+        """Advance one step and return the new state."""
         if self.resolved:
             return self.history[-1]
 
-        shock = self._rng.gauss(self.config.drift, self.config.volatility)
-        self._logit_price += shock
+        self._logit_price += self._next_shock
         self.step += 1
+
+        self._next_shock = self._draw_shock()
+        self.flow = self._draw_flow(self._next_shock)
 
         if (
             self.config.resolution_step is not None
@@ -137,10 +213,10 @@ class SimulatedMarket:
         return self._record()
 
     def _resolve(self) -> None:
-        """Résout le marché en tirant l'issue selon le prix courant.
+        """Resolve the market, drawing the outcome from the current price.
 
-        Tirer l'issue avec probabilité égale au prix garde le marché
-        cohérent : un contrat à 0,80 se résout « oui » huit fois sur dix.
+        Drawing the outcome with probability equal to the price keeps the
+        market coherent: a contract at 0.80 resolves yes eight times in ten.
         """
         self.outcome = 1 if self._rng.random() < self.mid_price else 0
         self.resolved = True
@@ -151,8 +227,30 @@ class SimulatedMarket:
             mid_price=self.mid_price,
             best_bid=self.best_bid,
             best_ask=self.best_ask,
+            flow=self.flow,
             resolved=self.resolved,
             outcome=self.outcome,
         )
         self.history.append(state)
         return state
+
+
+def _poisson(rng: random.Random, lam: float) -> int:
+    """Poisson draw by Knuth's method.
+
+    ``random.Random`` has no Poisson sampler and numpy is not a dependency
+    here. Adequate for the small intensities used (lambda of a few units).
+    """
+    if lam <= 0:
+        return 0
+
+    target = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while True:
+        p *= rng.random()
+        if p <= target:
+            return k
+        k += 1
+        if k > 1000:  # guard against pathological intensities
+            return k

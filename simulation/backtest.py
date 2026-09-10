@@ -1,14 +1,15 @@
-"""Boucle de backtest : fait tourner une stratégie amont sur le marché simulé."""
+"""Backtest loop: runs an upstream strategy against the simulated market."""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
-from poly_market_maker.order import Order
+from poly_market_maker.order import Order, Side
 from poly_market_maker.orderbook import OrderBook
 from poly_market_maker.strategies.amm_strategy import AMMStrategy
 from poly_market_maker.strategies.bands_strategy import BandsStrategy
@@ -16,13 +17,18 @@ from poly_market_maker.token import Token
 
 from .execution import ExecutionConfig, ExecutionEngine, Fill, Portfolio
 from .market_sim import MarketConfig, SimulatedMarket
+from .signal import FeatureState, SignalModel, extract_features
 
 logger = logging.getLogger(__name__)
+
+#: Steps per year, for annualising the Sharpe ratio. One step is taken to be
+#: one minute of a continuously trading market.
+STEPS_PER_YEAR = 525_600
 
 
 @dataclass
 class BacktestResult:
-    """Résultat d'un backtest, avec les séries nécessaires aux graphiques."""
+    """Backtest outcome, with the series needed for plots."""
 
     strategy: str
     steps: int
@@ -31,6 +37,7 @@ class BacktestResult:
     equity_curve: List[float] = field(default_factory=list)
     price_series: List[float] = field(default_factory=list)
     inventory_series: List[float] = field(default_factory=list)
+    skew_series: List[int] = field(default_factory=list)
     fills: List[Fill] = field(default_factory=list)
     fees_paid: float = 0.0
     resolved: bool = False
@@ -49,13 +56,40 @@ class BacktestResult:
         return len(self.fills)
 
     @property
+    def informed_fill_ratio(self) -> float:
+        """Share of fills taken by informed counterparties.
+
+        The adverse-selection rate. A skew that works lowers it: the maker
+        steps away from flow that is about to move against it.
+        """
+        if not self.fills:
+            return 0.0
+        return sum(f.informed_counterparty for f in self.fills) / len(self.fills)
+
+    @property
     def volume(self) -> float:
-        """Notionnel total échangé."""
+        """Total notional traded."""
         return sum(f.notional for f in self.fills)
 
     @property
+    def spread_captured(self) -> float:
+        """Average sale price minus average purchase price."""
+        buys = [f for f in self.fills if f.side == Side.BUY]
+        sells = [f for f in self.fills if f.side == Side.SELL]
+
+        buy_size = sum(f.size for f in buys)
+        sell_size = sum(f.size for f in sells)
+        if buy_size == 0 or sell_size == 0:
+            return 0.0
+
+        return (
+            sum(f.notional for f in sells) / sell_size
+            - sum(f.notional for f in buys) / buy_size
+        )
+
+    @property
     def max_drawdown_pct(self) -> float:
-        """Perte maximale depuis un sommet de la courbe de capital."""
+        """Largest peak-to-trough loss on the equity curve."""
         if not self.equity_curve:
             return 0.0
         peak = self.equity_curve[0]
@@ -68,31 +102,30 @@ class BacktestResult:
 
     @property
     def volatility_pct(self) -> float:
-        """Écart-type des rendements par pas, en pourcentage."""
-        returns = self._step_returns()
-        if len(returns) < 2:
+        """Standard deviation of per-step returns, in percent."""
+        rets = self._step_returns()
+        if len(rets) < 2:
             return 0.0
-        return 100.0 * statistics.stdev(returns)
+        return 100.0 * statistics.stdev(rets)
 
     @property
     def sharpe(self) -> float:
-        """Ratio rendement/risque par pas, sans taux sans risque.
+        """Annualised Sharpe ratio, no risk-free rate.
 
-        Non annualisé : un pas de simulation ne correspond à aucune durée
-        calendaire précise. L'indicateur sert à comparer des stratégies
-        entre elles sur un même jeu de paramètres, pas à être publié.
+        Annualised at one step per minute. The figure serves to compare runs
+        of this simulator, not for publication.
         """
-        returns = self._step_returns()
-        if len(returns) < 2:
+        rets = self._step_returns()
+        if len(rets) < 2:
             return 0.0
-        sigma = statistics.stdev(returns)
+        sigma = statistics.stdev(rets)
         if sigma == 0:
             return 0.0
-        return statistics.mean(returns) / sigma
+        return (statistics.mean(rets) / sigma) * math.sqrt(STEPS_PER_YEAR)
 
     @property
     def max_inventory_skew(self) -> float:
-        """Plus grand déséquilibre d'inventaire atteint."""
+        """Largest inventory imbalance reached."""
         return max((abs(x) for x in self.inventory_series), default=0.0)
 
     def _step_returns(self) -> List[float]:
@@ -104,24 +137,25 @@ class BacktestResult:
 
     def summary(self) -> Dict[str, float]:
         return {
-            "strategie": self.strategy,
-            "pas": self.steps,
-            "valeur_initiale": round(self.initial_value, 2),
-            "valeur_finale": round(self.final_value, 2),
+            "strategy": self.strategy,
+            "steps": self.steps,
+            "initial_value": round(self.initial_value, 2),
+            "final_value": round(self.final_value, 2),
             "pnl": round(self.pnl, 2),
-            "rendement_pct": round(self.return_pct, 3),
-            "executions": self.num_fills,
+            "return_pct": round(self.return_pct, 3),
+            "sharpe": round(self.sharpe, 3),
+            "max_drawdown_pct": round(self.max_drawdown_pct, 3),
+            "fills": self.num_fills,
+            "informed_fill_pct": round(100 * self.informed_fill_ratio, 1),
+            "spread_captured": round(self.spread_captured, 4),
             "volume": round(self.volume, 2),
-            "frais": round(self.fees_paid, 4),
-            "drawdown_max_pct": round(self.max_drawdown_pct, 3),
-            "volatilite_pct": round(self.volatility_pct, 4),
-            "sharpe": round(self.sharpe, 4),
-            "inventaire_max": round(self.max_inventory_skew, 2),
+            "fees": round(self.fees_paid, 4),
+            "max_inventory": round(self.max_inventory_skew, 1),
         }
 
 
 def load_strategy(name: str, config_path: str):
-    """Instancie une stratégie amont depuis son fichier de configuration."""
+    """Instantiate an upstream strategy from its config file."""
     with open(config_path, encoding="utf-8") as handle:
         config = json.load(handle)
 
@@ -130,7 +164,23 @@ def load_strategy(name: str, config_path: str):
         return AMMStrategy(config)
     if key == "bands":
         return BandsStrategy(config)
-    raise ValueError(f"Stratégie inconnue : {name!r} (attendu : amm ou bands)")
+    raise ValueError(f"Unknown strategy: {name!r} (expected amm or bands)")
+
+
+def _apply_skew(orders: List[Order], skew_ticks: int, tick: float = 0.01) -> None:
+    """Shift every quote by ``skew_ticks``, in place.
+
+    Both sides move together: a predicted rise makes the maker bid higher
+    *and* ask higher, so it is less likely to sell into the move and more
+    likely to accumulate ahead of it. Prices are clamped one tick inside
+    (0, 1), where a binary contract cannot trade.
+    """
+    if skew_ticks == 0:
+        return
+
+    shift = skew_ticks * tick
+    for order in orders:
+        order.price = round(min(0.99, max(0.01, order.price + shift)), 2)
 
 
 def run_backtest(
@@ -139,25 +189,28 @@ def run_backtest(
     steps: int = 500,
     market_config: Optional[MarketConfig] = None,
     execution_config: Optional[ExecutionConfig] = None,
+    signal: Optional[SignalModel] = None,
     initial_collateral: float = 1000.0,
     initial_shares: float = 500.0,
     seed: Optional[int] = None,
 ) -> BacktestResult:
-    """Fait tourner une stratégie sur un marché simulé.
+    """Run a strategy against the simulated market.
 
     Args:
-        strategy_name: ``"amm"`` ou ``"bands"``.
-        config_path: Fichier JSON de configuration de la stratégie.
-        steps: Nombre de pas de simulation.
-        market_config: Paramètres du marché ; valeurs par défaut sinon.
-        execution_config: Paramètres d'exécution ; valeurs par défaut sinon.
-        initial_collateral: Collatéral de départ en USDC.
-        initial_shares: Parts détenues au départ sur chaque jambe. Un market
-            maker doit posséder des parts pour pouvoir en vendre.
-        seed: Graine aléatoire, pour des résultats reproductibles.
+        strategy_name: ``"amm"`` or ``"bands"``.
+        config_path: JSON config for the strategy.
+        steps: Simulation steps.
+        market_config: Market parameters; defaults otherwise.
+        execution_config: Execution parameters; defaults otherwise.
+        signal: Fitted signal model used to skew quotes. Without one the
+            strategy quotes symmetrically, which is the baseline.
+        initial_collateral: Starting USDC.
+        initial_shares: Shares held on each leg at the start. A maker must
+            hold inventory to be able to sell.
+        seed: Random seed, for reproducibility.
 
     Returns:
-        Le résultat du backtest, séries temporelles comprises.
+        The backtest result, including time series.
     """
     market = SimulatedMarket(market_config or MarketConfig(), seed=seed)
     portfolio = Portfolio(initial_collateral)
@@ -171,6 +224,7 @@ def run_backtest(
         seed=None if seed is None else seed + 1,
     )
     strategy = load_strategy(strategy_name, config_path)
+    state = FeatureState()
 
     initial_value = portfolio.mark_to_market(market.mid_price)
     result = BacktestResult(
@@ -182,7 +236,10 @@ def run_backtest(
 
     for _ in range(steps):
         price_a = market.mid_price
+        flow = market.flow
         token_prices = {Token.A: price_a, Token.B: round(1.0 - price_a, 2)}
+
+        state.update(price_a, flow.imbalance)
 
         orderbook = OrderBook(
             orders=list(engine.open_orders),
@@ -193,23 +250,36 @@ def run_backtest(
 
         try:
             to_cancel, to_place = strategy.get_orders(orderbook, token_prices)
-        except Exception as exc:  # une stratégie ne doit pas tuer le backtest
-            logger.warning("Stratégie en erreur au pas %d : %s", market.step, exc)
+        except Exception as exc:  # a strategy failure must not kill the run
+            logger.warning("Strategy error at step %d: %s", market.step, exc)
             to_cancel, to_place = [], []
+
+        skew = 0
+        if signal is not None and signal.is_fitted:
+            features = extract_features(
+                state,
+                mid_price=price_a,
+                imbalance=flow.imbalance,
+                order_count=flow.buy_orders + flow.sell_orders,
+                inventory_skew=portfolio.inventory_skew,
+            )
+            skew = signal.skew_ticks(features)
+            _apply_skew(to_place, skew)
 
         engine.cancel_orders(to_cancel)
         engine.place_orders(to_place)
 
-        # Le marche bouge APRES le placement : un ordre passe parce que le
-        # prix vient le chercher. Confronter avant le mouvement ne remplirait
-        # jamais rien, la strategie recentrant ses ordres a chaque pas.
-        market.advance()
-        result.fills.extend(engine.match())
+        # Orders are matched against the flow arriving on this step, then the
+        # market moves. Informed flow therefore fills just before the move it
+        # anticipates, which is what adverse selection means.
+        result.fills.extend(engine.match(flow))
 
         result.equity_curve.append(portfolio.mark_to_market(market.mid_price))
         result.price_series.append(market.mid_price)
         result.inventory_series.append(portfolio.inventory_skew)
+        result.skew_series.append(skew)
 
+        market.advance()
         if market.resolved:
             break
 
@@ -227,16 +297,16 @@ def run_backtest(
 def run_sweep(
     strategy_name: str,
     config_path: str,
-    seeds: List[int],
+    seeds: Sequence[int],
     steps: int = 500,
     market_config: Optional[MarketConfig] = None,
     execution_config: Optional[ExecutionConfig] = None,
+    signal: Optional[SignalModel] = None,
 ) -> List[BacktestResult]:
-    """Rejoue le même backtest sur plusieurs graines.
+    """Replay the same backtest across several seeds.
 
-    Un backtest unique sur un marché aléatoire ne prouve rien : le résultat
-    dépend autant du tirage que de la stratégie. Comparer des distributions
-    sur plusieurs graines est le minimum pour conclure.
+    A single backtest on a random market proves nothing: the outcome depends
+    as much on the draw as on the strategy.
     """
     return [
         run_backtest(
@@ -245,6 +315,7 @@ def run_sweep(
             steps=steps,
             market_config=market_config,
             execution_config=execution_config,
+            signal=signal,
             seed=seed,
         )
         for seed in seeds

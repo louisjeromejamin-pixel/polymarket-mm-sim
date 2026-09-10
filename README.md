@@ -1,143 +1,132 @@
 # polymarket-mm-sim
 
-Backtest de stratégies de market making sur les marchés de prédiction Polymarket — **sans clé API, sans wallet et sans capital**.
+Offline backtesting of market-making strategies on Polymarket-style binary markets, with a learned quote skew. No API key, wallet or capital required.
 
-Le projet part du [keeper officiel de Polymarket](https://github.com/Polymarket/poly-market-maker) et lui ajoute la pièce qui lui manque : un environnement de simulation. Les stratégies amont sont conservées **telles quelles** ; seules les deux dépendances externes — l'API CLOB et la blockchain — sont remplacées par un marché synthétique et un moteur d'exécution local.
+Built on [Polymarket's official keeper](https://github.com/Polymarket/poly-market-maker) (MIT). The upstream strategies are unchanged; the two external dependencies — the CLOB API and the blockchain — are replaced by a simulated market and a local execution engine.
 
-## Pourquoi
+## Market model
 
-Le keeper officiel ne sait tourner qu'en production : il lui faut une clé privée, du USDC sur Polygon et un marché réel. Impossible, donc, de répondre hors ligne à des questions pourtant élémentaires — quelle stratégie résiste le mieux à la volatilité ? à partir de quel niveau de frais devient-elle non rentable ? quel déséquilibre d'inventaire faut-il tolérer ?
+A binary contract resolves to 0 or 1, so its price is a probability. The price evolves in log-odds
 
-Ce dépôt rend ces questions mesurables, et le premier résultat est arrivé sans qu'on le cherche : **le keeper amont plante sur un marché qui dérive vers sa résolution** (voir plus bas).
+$$\ell_{t+1} = \ell_t + \mu + \sigma \varepsilon_t, \qquad p_t = \frac{1}{1 + e^{-\ell_t}}$$
 
-## Installation
+which keeps $p_t \in (0,1)$ by construction and compresses moves near the bounds, where a near-resolved contract barely trades.
+
+Order flow arrives as $N_t \sim \mathrm{Poisson}(\lambda)$ counterparty orders per step, split into two populations:
+
+- **Informed** (probability $\phi$): trades in the direction of the coming move, $\mathbb{P}(\text{buy}) = 0.85$ if $\varepsilon_t > 0$. Filling it leaves the maker on the wrong side — adverse selection.
+- **Uninformed**: symmetric, $\mathbb{P}(\text{buy}) = 0.5$, and willing to concede up to 4 cents from the mid. That concession is the maker's revenue.
+
+The split is what makes the simulator informative. With $\phi = 1$ every counterparty is informed, no quote is ever hit at a favourable price, and no strategy can profit:
+
+| Informed share $\phi$ | Mean PnL | Profitable runs | Fills |
+|---:|---:|---:|---:|
+| 0.00 | 169.1 | 87.5% | 852 |
+| 0.20 | 126.0 | 82.5% | 686 |
+| 0.35 | 102.2 | 75.0% | 555 |
+| 0.50 | 65.4 | 70.0% | 417 |
+| 0.70 | 29.3 | 60.0% | 246 |
+| 1.00 | **0.0** | 0.0% | **0** |
+
+40 seeds per value, 400 steps per run, Bands strategy.
+
+## Strategy comparison
+
+50 seeds, 400 steps, $\phi = 0.35$, starting capital 1500 USDC:
+
+| Metric | AMM | Bands |
+|---|---:|---:|
+| Mean PnL | 82.4 | **101.1** |
+| Median PnL | 96.3 | 111.0 |
+| PnL std dev | 240.7 | **132.7** |
+| Median Sharpe | 14.3 | **29.5** |
+| Profitable runs | 66% | **78%** |
+| Mean drawdown | 19.9% | **10.7%** |
+| Max inventory | 1035 | **849** |
+
+Bands earns slightly more with half the dispersion and half the drawdown. The AMM quotes across a wider price range, so it accumulates inventory it did not choose.
+
+## Learned quote skew
+
+A maker quoting symmetrically around the mid holds whatever inventory the flow gives it. If the next move is partly predictable, shifting both quotes in that direction reduces adverse fills.
+
+Seven features, all observable at decision time: flow imbalance and its EMA, order count, realised volatility, last mid return, distance from 0.50, and normalised inventory. Target: the mid return over the next 3 steps.
+
+Production uses **ridge regression**, solved in closed form against the standard library:
+
+$$\hat{w} = (Z^\top Z + \alpha I)^{-1} Z^\top y$$
+
+on standardised features — the penalty is scale-dependent, and it also keeps the matrix invertible when the two imbalance features are collinear.
+
+The skew is capped at 3 ticks. Without a cap, the strategy stops making markets and becomes a directional bet on the model.
+
+### Model selection
+
+`research/signal_models.py` compares candidates on the same chronological split. 8337 training rows, 3573 test rows:
+
+| Model | Test R² | Directional acc. | Fit time |
+|---|---:|---:|---:|
+| mean baseline | −0.00031 | 50.4% | 0.00 s |
+| OLS | +0.01750 | 54.8% | 0.04 s |
+| **ridge (α = 1)** | **+0.01750** | **54.8%** | 0.11 s |
+| lasso | +0.01742 | 54.9% | 0.02 s |
+| random forest (d = 6) | **+0.02247** | 54.4% | 5.11 s |
+| gradient boosting | +0.00955 | 53.0% | 3.92 s |
+| LightGBM (d = 4) | −0.01103 | 52.9% | 1.75 s |
+| LightGBM (d = 8) | −0.12842 | 52.9% | 2.01 s |
+
+The random forest has the best R² but a *lower* directional accuracy, and only the sign matters for a quote skew. On 60 held-out seeds it also produced less PnL than ridge (+148 vs +154). LightGBM overfits outright: R² of −0.128 at depth 8.
+
+Ridge therefore ships, and the repo depends on neither scikit-learn nor LightGBM.
+
+Signal quality falls with the prediction horizon, as expected of microstructure:
+
+| Horizon (steps) | 1 | 2 | 3 | 5 | 10 | 20 |
+|---|---:|---:|---:|---:|---:|---:|
+| Test R² | +0.0355 | +0.0179 | +0.0175 | +0.0111 | +0.0111 | +0.0080 |
+
+### Out-of-sample result
+
+Trained on 30 seeds, evaluated on 400 seeds never used in training:
+
+| | Baseline | With signal |
+|---|---:|---:|
+| Mean PnL | 107.0 | **120.7** |
+| Median PnL | 132.6 | **150.1** |
+| Median Sharpe | 33.96 | **35.05** |
+| Profitable runs | 78.0% | **79.0%** |
+
+Paired difference **+13.71**, $t = +2.25$, $n = 400$.
+
+The sample size is not incidental. PnL has a standard deviation of ~144 across seeds, so detecting an effect of this magnitude needs roughly 370 paired runs: at $n = 100$ the same test swung between $t = +2.9$ and $t = +0.3$ depending on which seeds were drawn. The effect is real but small, and any claim from a smaller sample would have been noise.
+
+## Usage
 
 ```bash
-git clone https://github.com/louisjeromejamin-pixel/polymarket-mm-sim.git
-cd polymarket-mm-sim
-pip install -r requirements-sim.txt   # simulation seule : aucune dépendance lourde
+pip install -r requirements-sim.txt   # simulation only: standard library
 ```
-
-La simulation ne requiert **que la bibliothèque standard**. Le fichier `requirements.txt` d'origine (`web3`, `py-clob-client`…) n'est nécessaire que pour faire tourner le keeper en conditions réelles.
-
-## Utilisation
-
-### Un backtest
 
 ```bash
-python -m simulation.cli backtest --strategy amm --steps 300 --seed 42
+python -m simulation.cli backtest --strategy bands --steps 400 --seed 42
+python -m simulation.cli compare --seeds 50
+python -m simulation.cli signal --train-seeds 30 --test-seeds 400
+python -m simulation.cli sensitivity --param informed_ratio --values 0,0.35,0.7
 ```
-
-```
-Backtest — stratégie AMM
-
-  strategie         amm
-  pas               300
-  valeur initiale   1500.0
-  valeur finale     1426.25
-  pnl               -73.75
-  rendement pct     -4.916
-  executions        344
-  volume            1245.66
-  drawdown max pct  5.977
-  sharpe            -0.0759
-  inventaire max    314.2
-```
-
-### Comparer les deux stratégies
-
-```bash
-python -m simulation.cli compare --seeds 25 --steps 300
-```
-
-### Balayer un paramètre
-
-```bash
-python -m simulation.cli sensitivity --strategy bands --param volatility --values 0.05,0.10,0.15,0.25
-python -m simulation.cli sensitivity --strategy bands --param maker_fee --values 0,0.001,0.005,0.01
-```
-
-### Depuis Python
 
 ```python
-from simulation import run_sweep, MarketConfig
+from simulation import collect_dataset, train_signal, run_sweep, SignalModel
 
-results = run_sweep(
-    "bands", "config/bands.json",
-    seeds=range(50), steps=500,
-    market_config=MarketConfig(volatility=0.2, drift=0.01),
-)
-print(sum(r.pnl for r in results) / len(results))
+dataset = collect_dataset(seeds=range(30), steps=400, horizon=3)
+model, report = train_signal(dataset, alpha=1.0)
+print(report["r2_out_of_sample"])
+
+results = run_sweep("bands", "config/bands.json", range(1000, 1400),
+                    steps=400, signal=SignalModel(model))
 ```
 
-## Comment le marché est simulé
+## Upstream bug
 
-Un contrat binaire se résout à 0 ou 1 ; son prix, borné dans `(0, 1)`, **est** une probabilité. Une marche aléatoire ordinaire conviendrait mal : elle sortirait de l'intervalle, et donnerait la même volatilité absolue à un contrat coté 0,50 qu'à un contrat coté 0,02 — alors qu'un marché quasi résolu ne bouge presque plus.
-
-Le prix évolue donc en **log-odds** :
-
-```
-logit(p) = log(p / (1 − p))
-```
-
-La marche aléatoire est libre sur tout l'axe réel, et la sigmoïde ramène le prix dans `(0, 1)` par construction, en compressant naturellement les mouvements près des bornes.
-
-**Le modèle d'exécution** reste volontairement pessimiste, pour ne pas fabriquer de performance fictive :
-
-- un ordre n'est touché que si le prix vient effectivement le chercher ;
-- même touché, il n'est servi qu'avec une probabilité `fill_probability` (0,6 par défaut) — sur un vrai carnet, être au bon prix ne garantit pas d'être en tête de file ;
-- les exécutions sont **partielles** ;
-- un achat sans collatéral suffisant ou une vente à découvert sont **refusés**.
-
-L'ordre des opérations dans la boucle est ce qui compte le plus : la stratégie place ses ordres, **puis** le marché bouge, **puis** on confronte. L'inverse ne remplirait jamais rien, puisque la stratégie recentre ses ordres autour du prix courant à chaque pas.
-
-## Résultats
-
-### AMM contre Bands
-
-25 graines, 300 pas, volatilité 0,15, capital initial 1 500 USDC :
-
-| Métrique | AMM | Bands |
-|---|---:|---:|
-| PnL moyen | −36,39 | **−18,70** |
-| PnL médian | −36,00 | −19,77 |
-| Écart-type du PnL | 73,11 | **27,54** |
-| Pire run | −227,58 | **−76,34** |
-| Meilleur run | **70,82** | 31,48 |
-| Runs gagnants | 24 % | 28 % |
-| Exécutions | 490,4 | 268,6 |
-| Drawdown moyen | 6,57 % | **2,80 %** |
-| Inventaire max | 485,4 | **172,1** |
-
-**Bands domine sur le risque, pas sur le rendement.** Elle perd deux fois moins, avec un écart-type presque trois fois inférieur, et surtout un inventaire maîtrisé : 172 parts de déséquilibre contre 485 pour l'AMM, qui accumule jusqu'à engager la quasi-totalité de sa position d'un seul côté. En contrepartie, elle négocie deux fois moins et plafonne plus bas sur ses meilleurs runs.
-
-**Les deux stratégies perdent de l'argent en moyenne.** Ce n'est pas un défaut du simulateur : c'est la **sélection adverse**, le risque structurel du métier. Un market maker achète quand le prix descend et vend quand il monte ; sur une martingale sans dérive, il se retrouve systématiquement du mauvais côté du mouvement. En production, ce coût est compensé par le spread capturé sur le flux non informé et par les incitations à la liquidité — deux choses que ce simulateur ne modélise pas. Les chiffres servent donc à **comparer des stratégies entre elles**, pas à prédire une rentabilité.
-
-### Sensibilité à la volatilité (Bands, 20 graines)
-
-| Volatilité | PnL moyen | Écart-type | Runs gagnants |
-|---:|---:|---:|---:|
-| 0,05 | −6,43 | 11,92 | 25 % |
-| 0,10 | −10,18 | 24,27 | 40 % |
-| 0,15 | −20,25 | 28,59 | 25 % |
-| 0,25 | −34,74 | 28,13 | 15 % |
-
-La perte croît de façon monotone avec la volatilité : c'est la signature attendue de la sélection adverse — plus le marché bouge, plus le market maker est pris à contre-pied.
-
-### Sensibilité aux frais (Bands, 20 graines)
-
-| Frais maker | PnL moyen | Runs gagnants |
-|---:|---:|---:|
-| 0 % | −20,25 | 25 % |
-| 0,1 % | −20,95 | 25 % |
-| 0,5 % | −23,71 | 20 % |
-| 1 % | −27,17 | 15 % |
-
-Polymarket ne prélève pas de frais maker aujourd'hui. S'ils étaient introduits à 1 %, ils coûteraient ici ~7 USDC sur 300 pas — un tiers de la perte moyenne. Une stratégie qui ne serait que marginalement rentable n'y survivrait pas.
-
-## Le bug trouvé dans le keeper officiel
-
-En poussant la volatilité, le backtest a fait remonter une exception dans la stratégie AMM amont :
+Running the AMM strategy under high volatility surfaced an exception in the upstream code:
 
 ```
 File "poly_market_maker/strategies/amm.py", line 107, in phi
@@ -145,61 +134,44 @@ File "poly_market_maker/strategies/amm.py", line 107, in phi
 ZeroDivisionError: float division by zero
 ```
 
-Quand le prix atteint une borne de la plage configurée (`p_min` = 0,05 ou `p_max` = 0,95), `set_price()` produit `p_l == p_i` et une liste `buy_prices` vide. Les deux cas dégénèrent : division par zéro d'un côté, `IndexError` sur `buy_prices[0]` de l'autre.
+When the price reaches a bound of the configured range (`p_min` = 0.05, `p_max` = 0.95), `set_price()` yields `p_l == p_i` and an empty `buy_prices` list — division by zero on one path, `IndexError` on the other. Every prediction market drifts towards 0 or 1 as it approaches resolution, so a keeper left running on a settling market reaches this state.
 
-Ce n'est pas un cas de laboratoire — **tout marché de prédiction dérive vers 0 ou 1 en approchant de sa résolution**. Un keeper laissé tourner sur un marché qui se dénoue rencontre nécessairement cette situation.
+Fixed in [`amm.py`](poly_market_maker/strategies/amm.py) by returning a zero allocation in the degenerate cases; a test asserts no strategy error over 400 steps at volatility 0.5.
 
-Le correctif ([`amm.py`](poly_market_maker/strategies/amm.py)) renvoie une allocation nulle dans ces deux cas : quand aucun achat n'est possible de ce côté, il n'y a pas de collatéral à lui allouer. Un test ([`test_backtest.py`](tests/test_backtest.py)) vérifie qu'aucune erreur de stratégie ne remonte sur 400 pas à volatilité 0,5.
-
-## Structure
+## Layout
 
 ```
-poly_market_maker/       # code amont (Polymarket, MIT) — stratégies inchangées
-├── strategies/
-│   ├── amm.py           # + correctif des cas dégénérés dans phi()
-│   ├── bands.py
-│   └── ...
-├── order.py             # + import py_clob_client rendu optionnel
-└── utils.py             # + imports web3/yaml rendus optionnels
-simulation/              # ajouts de ce dépôt
-├── market_sim.py        # marché binaire en log-odds
-├── execution.py         # carnet, exécutions partielles, portefeuille
-├── backtest.py          # boucle de backtest et métriques
-└── cli.py               # backtest / compare / sensitivity
-tests/                   # 38 tests
-config/                  # configurations amont des stratégies
-docs/                    # documentation amont des stratégies
+poly_market_maker/       upstream code (Polymarket, MIT), strategies unchanged
+  strategies/amm.py      + fix for the degenerate cases in phi()
+  order.py, utils.py     + py_clob_client / web3 imports made optional
+simulation/
+  market_sim.py          log-odds price, informed and uninformed flow
+  execution.py           flow-driven matching, portfolio, adverse selection
+  signal.py              features, ridge regression, quote skew
+  training.py            data collection, train/test split, fitting
+  backtest.py            backtest loop and risk metrics
+  cli.py                 backtest / compare / signal / sensitivity
+research/
+  signal_models.py       model comparison (needs scikit-learn, LightGBM)
+tests/                   83 tests
 ```
-
-Les trois modifications du code amont sont minimales et signalées en commentaire. Les deux dernières servent uniquement à faire tourner les stratégies hors ligne : sans elles, importer un `Order` exigeait d'installer tout `web3`.
-
-## Tests
 
 ```bash
-pip install pytest
-python -m pytest tests -q
+pytest
 ```
 
-Les tests couvrent l'aller-retour logit/sigmoïde, le maintien du prix dans `(0, 1)` sous volatilité extrême, le sens des exécutions (un achat sous le marché ne passe pas ; le marché doit venir le chercher), la complémentarité des prix des deux tokens, le refus des ventes à découvert et des achats sans collatéral, la reproductibilité à graine fixée, et la non-régression du correctif AMM.
+Tests cover the logit/sigmoid round trip, price bounds under extreme volatility, the Poisson generator's mean and variance, ridge recovering a known linear relation, negative out-of-sample R² on pure noise, refusal of short sales and uncollateralised buys, and the fact that informed flow never trades at a price favourable to the maker.
 
-## Limites
+## Limitations
 
-- **Le marché ignore le market maker.** Ses ordres ne déplacent pas le prix, ce qui surestime la performance à taille importante.
-- **Pas de flux informé/non informé.** Un vrai carnet mêle des contreparties bruitées, dont le market maker tire son revenu. Ici, toute contrepartie est effectivement informée — d'où des PnL négatifs par construction.
-- **Aucune incitation à la liquidité**, alors qu'elles constituent une part majeure du revenu réel sur Polymarket.
-- **Le pas de simulation n'a pas de durée calendaire**, donc le Sharpe affiché n'est pas annualisé et ne se compare qu'entre runs de ce simulateur.
+- **The market ignores the maker.** Its orders do not move the price, which overstates performance at size.
+- **Informed flow is a two-state model.** Real flow has a continuum of information content.
+- **No liquidity rewards**, a significant part of real Polymarket revenue.
+- **A step has no calendar duration**, so the annualised Sharpe is comparable only across runs of this simulator.
+- **Synthetic prices.** Replaying historical Polymarket order books would be the next step.
 
-## Prochaines étapes
+## Credits
 
-- Rejouer des carnets **historiques** réels via l'API publique Polymarket, plutôt qu'un marché synthétique.
-- Modéliser deux flux de contreparties (informé / non informé) pour rendre le market making rentable et mesurer le point d'équilibre.
-- Ajouter une stratégie à **skew d'inventaire** : décaler les cotations en fonction de la position pour ramener activement l'inventaire vers zéro.
-- Simuler l'impact de marché des ordres du keeper.
+`poly_market_maker/` comes from [Polymarket/poly-market-maker](https://github.com/Polymarket/poly-market-maker), MIT licensed, copyright (c) 2023 Polymarket. The original licence is kept in [LICENSE](LICENSE).
 
-## Crédits et licence
-
-Le répertoire `poly_market_maker/` provient de [Polymarket/poly-market-maker](https://github.com/Polymarket/poly-market-maker), distribué sous licence MIT — copyright (c) 2023 Polymarket. La licence d'origine est conservée dans [LICENSE](LICENSE).
-
-Les ajouts de ce dépôt (`simulation/`, `tests/`) et les correctifs apportés au code amont sont publiés sous la même licence MIT.
-
-> **Avertissement.** Ce projet est un outil d'étude. Il ne constitue pas un conseil en investissement, et les résultats de simulation ne préjugent en rien de performances réelles. Le code de trading en production du dépôt amont est expérimental — l'utiliser avec du capital réel est à vos risques.
+> Study tool. Not investment advice; simulated results say nothing about live performance.
