@@ -1,0 +1,3 @@
+# Simulation hors ligne : aucune dependance externe requise.
+# La bibliotheque standard suffit ; pytest sert uniquement aux tests.
+pytest>=7.0
